@@ -57,6 +57,10 @@ void sigint_handler(int s)
 class K2G {
 
 public:
+	/// registration modality encoded for clarity. Look at the new getter
+	enum class Registration {
+		None, Undistorted, ColorToDepth, DepthToColor
+	};
 
 	K2G(Processor p = CPU, bool mirror = false, std::string serial = std::string()): mirror_(mirror), listener_(libfreenect2::Frame::Color | libfreenect2::Frame::Ir | libfreenect2::Frame::Depth), 
 	                                       undistorted_(512, 424, 4), registered_(512, 424, 4), big_mat_(1920, 1082, 4), qnan_(std::numeric_limits<float>::quiet_NaN()){
@@ -394,6 +398,82 @@ public:
 		listener_.release(frames_);
 	}
 
+
+	void get(cv::Mat & color_mat, cv::Mat & depth_mat, Registration mode, bool filter_points)
+	{
+		listener_.waitForNewFrame(frames_);
+		libfreenect2::Frame * rgb = frames_[libfreenect2::Frame::Color];
+		libfreenect2::Frame * depth = frames_[libfreenect2::Frame::Depth];
+		cv::Mat color_tmp;
+		cv::Mat depth_tmp;
+		int ownership = 0; // ownership of the map wrt this CLASS
+
+		switch(mode)
+		{
+			case Registration::None:
+			{
+				color_tmp = cv::Mat(rgb->height, rgb->width, CV_8UC4, rgb->data);
+				depth_tmp = cv::Mat(depth->height, depth->width, CV_32FC1, depth->data);
+				ownership = 0;
+				break;
+			}
+			case Registration::Undistorted:
+			{
+				registration_->undistorDepth(depth,&undistorted_);
+				color_tmp = cv::Mat(rgb->height, rgb->width, CV_8UC4, rgb->data);
+				depth_tmp = cv::Mat(undistorted_.height, undistorted_.width, CV_32FC1, undistorted_.data);
+				ownership = 2;
+				break;
+			}
+			case Registration::ColorToDepth:
+			{
+				registration_->apply(rgb, depth, &undistorted_, &registered_, filter_points, &tmp_big_mat_, tmp_map_);
+				color_tmp = cv::Mat(registered_.height, registered_.width, CV_8UC4, registered_.data); 
+				depth_tmp = cv::Mat(undistorted_.height, undistorted_.width, CV_32FC1, undistorted_.data);
+				ownership = 3;
+				break;
+			}
+			case Registration::DepthToColor:
+			{
+				registration_->apply(rgb, depth, &undistorted_, &registered_, true, &tmp_big_mat_, tmp_map_);
+				color_tmp = cv::Mat(rgb->height, rgb->width, CV_8UC4, rgb->data);
+				depth_tmp = cv::Mat(rgb->height,tmp_big_mat_.width, CV_32FC1, tmp_big_mat_.data);
+				ownership = 2;
+				break;
+			}
+		}
+
+		if(mirror_) 
+		{
+			// always needs to reallocate
+			if(depth_mat.channels() == CV_32FC1)	
+				depth_mat.resize(depth_tmp.rows,depth_tmp.cols);
+			else
+				depth_mat = cv::Mat(depth_tmp.rows,depth_tmp.cols, CV_32FC1);
+
+			if(color_mat.channels() == CV_8UC4)	
+				color_mat.resize(color_tmp.rows,color_tmp.cols);
+			else
+				color_mat = cv::Mat(color_tmp.rows,color_tmp.cols, CV_8UC4);
+
+			cv::flip(depth_tmp, depth_mat, 1);
+			cv::flip(color_tmp, color_mat, 1);
+		}
+		else
+		{
+			// TODO: instead of clone we could COPY over the inputs
+
+			// clone only if needed
+			if((ownership & 1) == 0)
+				color_mat = color_tmp.clone();
+			if((ownership & 2) == 0)
+				depth_mat = depth_tmp.clone();
+		}
+
+		listener_.release(frames_);
+
+	}
+
 	// Depth and color are aligned and registered 
 	void get(cv::Mat & color_mat, cv::Mat & depth_mat, const bool full_hd = true, const bool remove_points = false){
 		listener_.waitForNewFrame(frames_);
@@ -569,3 +649,114 @@ private:
 	boost::archive::binary_oarchive * oa_;
 #endif  
 };
+
+/**
+ * Holds the K2 parameters for the two frames depending on the specific registration mode employed
+ */
+struct K2G_Parameters
+{
+public:
+	K2G_Parameters(K2G & k2g, K2G::RegistrationMode mode);
+
+	libfreenect2::Freenect2Device::IrCameraParams ir;
+	libfreenect2::Freenect2Device::ColorCameraParams rgb;
+	cv::Size2i rgb_size;
+	cv::Size2i ir_size;
+	 
+	cv::Mat getKir();
+	cv::Mat getKrgb();
+	cv::Mat getDir();
+	cv::Mat getDrgb();
+};
+
+
+inline K2G_Parameters::K2G_Parameters(K2G & k2g, K2G::RegistrationMode mode)
+{
+	auto cp = k2g.getRgbCameraParams();
+	auto dp = k2g.getIrParameters();
+	switch(mode)
+	{
+		case K2G::RegistrationMode::None:
+		{
+			rgb =cp;
+			ir = dp;
+			rgb_size = {1920,1080};
+			ir_size = {512,424};
+			break;
+		}
+		case K2G::RegistrationMode::Undistorted:
+		{
+			rgb =cp;
+			ir = dp;
+			ir.k1 = 0;
+			ir.k2 = 0;
+			ir.k3 = 0;
+			ir.p1 = 0;
+			ir.p2 = 0;
+			rgb_size = {1920,1080};
+			ir_size = {512,424};
+			break;
+		}
+		case K2G::RegistrationMode::ColorToDepth:
+		{
+			ir = dp;
+			ir.k1 = 0;
+			ir.k2 = 0;
+			ir.k3 = 0;
+			ir.p1 = 0;
+			ir.p2 = 0;
+			rgb = ir;
+			ir_size = rgb_size = {512,424};
+			break;
+		}
+		case K2G::RegistrationMode::DepthToColor:
+		{
+			rgb = cp;
+			ir = rgb;
+			ir_size = rgb_size = {1920,1080};
+			break;
+		}	
+	}
+}
+
+inline cv::Mat K2G_Parameters::getKir()
+{
+	cv::Mat m = cv::Mat::eye(3, 3, CV_32F);
+	m.at<float>(0,0) = ir.fx;
+	m.at<float>(1,1) = ir.fy;
+	m.at<float>(0,2) = ir.cx;
+	m.at<float>(1,2) = ir.cy;
+	return m;
+}
+
+inline cv::Mat K2G_Parameters::getKrgb()
+{
+	cv::Mat m = cv::Mat::eye(3, 3, CV_32F);
+	m.at<float>(0,0) = rgb.fx;
+	m.at<float>(1,1) = rgb.fy;
+	m.at<float>(0,2) = rgb.cx;
+	m.at<float>(1,2) = rgb.cy;
+	return m;
+}
+
+inline cv::Mat K2G_Parameters::getDir()
+{
+	cv::Mat m = cv::Mat::eye(5, 1, CV_32F);
+	m.at<float>(0,0) = rgb.k1;
+	m.at<float>(1,0) = rgb.k2;
+	m.at<float>(2,0) = rgb.k3;
+	m.at<float>(3,0) = rgb.p1;
+	m.at<float>(4,0) = rgb.p2;
+	return m;
+}
+
+inline cv::Mat K2G_Parameters::getDrgb()
+{
+	cv::Mat m = cv::Mat::eye(5, 1, CV_32F);
+	m.at<float>(0,0) = ir.k1;
+	m.at<float>(1,0) = ir.k2;
+	m.at<float>(2,0) = ir.k3;
+	m.at<float>(3,0) = ir.p1;
+	m.at<float>(4,0) = ir.p2;
+	return m;
+}
